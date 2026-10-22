@@ -1,0 +1,31 @@
+# Render Blueprint specification for FactoryMind AI Backend
+services:
+  - type: web
+    name: factorymind-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: oregon
+    healthCheckPath: /api/health
+    envVars:
+      - key: LIVE_STREAM_URL
+        value: https://unviable-trickily-broadband.ngrok-free.dev/stream
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_DATABASE
+        value: factorymind_ai
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USE_TLS
+        value: "true"
