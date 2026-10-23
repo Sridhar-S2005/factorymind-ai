@@ -5,7 +5,7 @@ import {
   Search, Settings2, ShieldCheck, Thermometer, Waves, Zap, Wrench,
   Factory, ClipboardCheck, TrendingUp, TrendingDown, DollarSign, FileText, Download,
   Save, Clock3, Settings, Check, CircleGauge, PackageCheck, Mail, BrainCircuit, Send, Bot, Sparkles,
-  ArrowUpRight, ArrowDownRight, Scale
+  ArrowUpRight, ArrowDownRight, Scale, X
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -45,6 +45,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState({ records: [], connected: false, snapshot_count: 0 })
   const [health, setHealth] = useState({})
   const [activeNav, setActiveNav] = useState('Overview')
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [now, setNow] = useState(new Date())
@@ -203,21 +204,28 @@ export default function App() {
   }
 
   return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand">
-        <div className="brand-mark"><Activity size={23}/></div>
-        <div><div className="brand-name">FactoryMind<span> AI</span></div><div className="brand-caption">INDUSTRIAL INTELLIGENCE</div></div>
+    <div className={`mobile-backdrop ${mobileMenuOpen ? 'open' : ''}`} onClick={() => setMobileMenuOpen(false)} />
+    <aside className={`sidebar ${mobileMenuOpen ? 'mobile-open' : ''}`}>
+      <div className="sidebar-header-row">
+        <div className="brand">
+          <div className="brand-mark"><Activity size={23}/></div>
+          <div><div className="brand-name">FactoryMind<span> AI</span></div><div className="brand-caption">INDUSTRIAL INTELLIGENCE</div></div>
+        </div>
+        <button className="mobile-close-btn" onClick={() => setMobileMenuOpen(false)} aria-label="Close menu"><X size={18}/></button>
       </div>
       <div className="plant-selector"><div className="plant-dot"/><div><b>Milkshake Plant</b><small>Milkshake Line 01</small></div><ChevronDown size={15}/></div>
       <div className="nav-caption">WORKSPACE</div>
-      <nav>{nav.map(item => <button key={item.name} className={`nav-item ${activeNav===item.name?'active':''}`} onClick={() => setActiveNav(item.name)}><item.icon size={18}/><span>{item.name}</span>{item.name==='Alarm Center' && currentAlerts>0 && <em>{currentAlerts}</em>}</button>)}</nav>
+      <nav>{nav.map(item => <button key={item.name} className={`nav-item ${activeNav===item.name?'active':''}`} onClick={() => { setActiveNav(item.name); setMobileMenuOpen(false); }}><item.icon size={18}/><span>{item.name}</span>{item.name==='Alarm Center' && currentAlerts>0 && <em>{currentAlerts}</em>}</button>)}</nav>
       <div className="sidebar-spacer"/>
       <div className="sidebar-status"><div className={`status-icon ${snapshot.connected?'good':'bad'}`}><RadioTower size={17}/></div><div><b>{snapshot.connected?'Stream connected':'Stream disconnected'}</b><small>{snapshot.connected?'Receiving sensor snapshots':'Check FastAPI / ngrok'}</small></div><span className={`status-light ${snapshot.connected?'on':'off'}`}/></div>
       <div className="sidebar-bottom"><div className="profile"><div className="avatar">FM</div><div><b>FactoryMind Admin</b><small>Operations workspace</small></div><ChevronDown size={15}/></div></div>
     </aside>
     <main className="main">
       <header className="topbar">
-        <div className="crumb"><span>Workspace</span><span className="slash">/</span><b>{activeNav}</b></div>
+        <div className="topbar-left">
+          <button className="mobile-menu-btn" onClick={() => setMobileMenuOpen(true)} aria-label="Open menu"><Menu size={20}/></button>
+          <div className="crumb"><span>Workspace</span><span className="slash">/</span><b>{activeNav}</b></div>
+        </div>
         <div className="top-actions"><div className="clock">{now.toLocaleDateString()} <b>{now.toLocaleTimeString()}</b></div><button className="icon-button" title="Refresh" onClick={async()=>{setRefreshing(true);await load();setRefreshing(false)}}><RefreshCw size={17} className={refreshing?'spin':''}/></button><button className="icon-button notification" title="Alarms"><Bell size={18}/>{currentAlerts>0&&<i/>}</button><div className="avatar small">FM</div></div>
       </header>
       <div className="page-content">
