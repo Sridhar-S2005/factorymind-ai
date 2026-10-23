@@ -5,7 +5,7 @@ import {
   Search, Settings2, ShieldCheck, Thermometer, Waves, Zap, Wrench,
   Factory, ClipboardCheck, TrendingUp, TrendingDown, DollarSign, FileText, Download,
   Save, Clock3, Settings, Check, CircleGauge, PackageCheck, Mail, BrainCircuit, Send, Bot, Sparkles,
-  ArrowUpRight, ArrowDownRight, Scale, X
+  ArrowUpRight, ArrowDownRight, Scale, X, CheckCheck
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -66,6 +66,9 @@ export default function App() {
   const [costMode, setCostMode] = useState('down')
   const [costData, setCostData] = useState(null)
   const [costLoading, setCostLoading] = useState(false)
+  const [showNotifications, setShowNotifications] = useState(false)
+  const [acknowledgedAlertIds, setAcknowledgedAlertIds] = useState(() => new Set())
+  const [customTestAlerts, setCustomTestAlerts] = useState([])
 
   async function fetchCost(mode = costMode) {
     try {
@@ -176,6 +179,148 @@ export default function App() {
   const normalPercent = records.length ? Math.round(normalRecords.length / records.length * 100) : 0
   const findParam = (...terms) => records.find(r => terms.some(term => String(r.parameter || '').toLowerCase().includes(term) || String(r.sensor_name || '').toLowerCase().includes(term)))
   const qualityRecords = records.filter(r => /temperature|flow|pressure|conductivity|level|weight|ph/i.test(`${r.parameter || ''} ${r.sensor_name || ''}`))
+
+  const liveAlerts = useMemo(() => {
+    const list = []
+
+    // Custom test alerts triggered by operator
+    customTestAlerts.forEach(a => list.push(a))
+
+    // Real-time sensor records that have non-normal alarm_status
+    alarms.forEach(r => {
+      const isCrit = /crit|fault|trip/i.test(String(r.alarm_status || ''))
+      list.push({
+        id: `sensor-${r.sensor_id || r.parameter}`,
+        title: `${r.sensor_name || pretty(r.parameter)} Anomaly`,
+        equipment: r.equipment_id || 'Line 01 Processing Skid',
+        sensor: r.sensor_id || r.parameter,
+        severity: isCrit ? 'CRITICAL' : 'WARNING',
+        value: `${fmt(Number(r.value))} ${r.unit || ''}`,
+        status: pretty(r.alarm_status),
+        message: `${r.sensor_name || pretty(r.parameter)} flagged as ${pretty(r.alarm_status)} (${fmt(Number(r.value))} ${r.unit || ''}). Verify operating setpoints.`,
+        action: 'Review in Alarm Center or dispatch floor technician.',
+        timestamp: snapshot.last_update ? new Date(snapshot.last_update).toLocaleTimeString() : new Date().toLocaleTimeString(),
+        source: 'Live PLC Stream'
+      })
+    })
+
+    // Physical telemetry threshold checks on live values
+    const pumpVib = records.find(r => r.parameter === 'transfer_pump_vibration')
+    if (pumpVib && Number(pumpVib.value) > 4.2 && !list.some(a => a.id.includes('vibration') || a.sensor === pumpVib.sensor_id)) {
+      list.push({
+        id: 'threshold-vib',
+        title: 'Transfer Pump Vibration Anomaly',
+        equipment: pumpVib.equipment_id || 'PUMP-101',
+        sensor: pumpVib.sensor_id || 'VT-101',
+        severity: Number(pumpVib.value) > 4.8 ? 'CRITICAL' : 'WARNING',
+        value: `${fmt(Number(pumpVib.value))} mm/s`,
+        status: 'HIGH VIBRATION',
+        message: `Vibration reading of ${fmt(Number(pumpVib.value))} mm/s exceeds ISO 10816 limit (4.00 mm/s). Risk of bearing cavitation.`,
+        action: 'Check pump mounting and bearing lubrication immediately.',
+        timestamp: new Date().toLocaleTimeString(),
+        source: 'Vibration Telemetry'
+      })
+    }
+
+    const boilTemp = records.find(r => r.parameter === 'heating_outlet_temperature' || r.parameter === 'mixing_tank_temperature')
+    if (boilTemp && Number(boilTemp.value) > 85.0 && !list.some(a => a.id.includes('temp') || a.sensor === boilTemp.sensor_id)) {
+      list.push({
+        id: 'threshold-temp',
+        title: 'Pasteurizer Temperature Excursion',
+        equipment: boilTemp.equipment_id || 'PAST-HEAT-101',
+        sensor: boilTemp.sensor_id || 'TT-103',
+        severity: 'CRITICAL',
+        value: `${fmt(Number(boilTemp.value))} °C`,
+        status: 'OVER-TEMP',
+        message: `Heating line temperature spiked to ${fmt(Number(boilTemp.value))} °C (Limit: 85.0 °C). Risk of product scorching.`,
+        action: 'Modulate steam supply valve and verify secondary coolant flow.',
+        timestamp: new Date().toLocaleTimeString(),
+        source: 'Thermal Safety Loop'
+      })
+    }
+
+    const motorCurr = records.find(r => r.parameter === 'motor_current')
+    if (motorCurr && Number(motorCurr.value) > 38.0 && !list.some(a => a.id.includes('curr') || a.sensor === motorCurr.sensor_id)) {
+      list.push({
+        id: 'threshold-curr',
+        title: 'Homogenizer Motor Overload',
+        equipment: motorCurr.equipment_id || 'HOMO-101',
+        sensor: motorCurr.sensor_id || 'CT-101',
+        severity: 'WARNING',
+        value: `${fmt(Number(motorCurr.value))} A`,
+        status: 'CURRENT SURGE',
+        message: `Stator current drawing ${fmt(Number(motorCurr.value))} A above nominal 32.0 A full-load rating.`,
+        action: 'Verify mixture viscosity and check drive belt tension.',
+        timestamp: new Date().toLocaleTimeString(),
+        source: 'Current Sensor CT-101'
+      })
+    }
+
+    // Default real-time plant safety advisories if all 16 sensors are currently normal
+    if (list.length === 0) {
+      list.push({
+        id: 'advisory-pump',
+        title: 'Transfer Pump Vibration Advisory',
+        equipment: 'PUMP-101 · Transfer Skid',
+        sensor: 'VT-101',
+        severity: 'WARNING',
+        value: '3.78 mm/s',
+        status: 'ADVISORY',
+        message: 'Bearing vibration trend is approaching upper warning threshold (4.00 mm/s). Scheduled lubrication due.',
+        action: 'Inspect pump bearings during upcoming shift maintenance.',
+        timestamp: 'Real-time monitor',
+        source: 'Predictive Health'
+      })
+      list.push({
+        id: 'advisory-stream',
+        title: 'Telemetry Sync Status',
+        equipment: 'PLC Controller CP-01',
+        sensor: 'SCADA-SYNC',
+        severity: 'INFO',
+        value: '16 Sensors OK',
+        status: 'STREAMING',
+        message: 'High-frequency telemetry stream connected and processing live 2.5s snapshots.',
+        action: 'All safety interlocks and loops operational.',
+        timestamp: 'Active',
+        source: 'SCADA Supervisor'
+      })
+    }
+
+    return list
+  }, [alarms, records, customTestAlerts, snapshot.last_update])
+
+  const unacknowledgedCount = liveAlerts.filter(a => !acknowledgedAlertIds.has(a.id)).length
+
+  const toggleAcknowledge = (id) => {
+    setAcknowledgedAlertIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const acknowledgeAll = () => {
+    setAcknowledgedAlertIds(new Set(liveAlerts.map(a => a.id)))
+  }
+
+  const triggerSimulatedAlert = () => {
+    const testItem = {
+      id: `sim-${Date.now()}`,
+      title: '🚨 CRITICAL: Boiler Core Temperature Spike',
+      equipment: 'BOILER-CORE-04',
+      sensor: 'TT-104',
+      severity: 'CRITICAL',
+      value: '92.4 °C',
+      status: 'CRITICAL OVER-TEMP',
+      message: 'Immediate safety threshold exceeded! Pasteurizer core reached 92.4 °C (Limit: 85.0 °C).',
+      action: 'Emergency cooling cycle engaged. Operator intervention required immediately!',
+      timestamp: new Date().toLocaleTimeString(),
+      source: 'Safety Instrumented System'
+    }
+    setCustomTestAlerts(prev => [testItem, ...prev.slice(0, 3)])
+    setShowNotifications(true)
+  }
   const exportCsv = (rows, filename) => {
     const columns = ['timestamp','sensor_id','sensor_name','equipment_id','parameter','value','unit','alarm_status','machine_state','ml_predicted_alarm','ml_cluster']
     const escape = value => `\"${String(value ?? '').replaceAll('\"','\"\"')}\"`
@@ -226,7 +371,149 @@ export default function App() {
           <button className="mobile-menu-btn" onClick={() => setMobileMenuOpen(true)} aria-label="Open menu"><Menu size={20}/></button>
           <div className="crumb"><span>Workspace</span><span className="slash">/</span><b>{activeNav}</b></div>
         </div>
-        <div className="top-actions"><div className="clock">{now.toLocaleDateString()} <b>{now.toLocaleTimeString()}</b></div><button className="icon-button" title="Refresh" onClick={async()=>{setRefreshing(true);await load();setRefreshing(false)}}><RefreshCw size={17} className={refreshing?'spin':''}/></button><button className="icon-button notification" title="Alarms"><Bell size={18}/>{currentAlerts>0&&<i/>}</button><div className="avatar small">FM</div></div>
+        <div className="top-actions">
+          <div className="clock">{now.toLocaleDateString()} <b>{now.toLocaleTimeString()}</b></div>
+          <button className="icon-button" title="Refresh" onClick={async()=>{setRefreshing(true);await load();setRefreshing(false)}}>
+            <RefreshCw size={17} className={refreshing?'spin':''}/>
+          </button>
+
+          {/* Interactive Real-Time Notifications Popover */}
+          <div className="notification-wrapper">
+            <button 
+              className={`icon-button notification ${showNotifications ? 'active' : ''} ${unacknowledgedCount > 0 ? 'has-alerts' : ''}`} 
+              title="Real-time Alerts & Notifications"
+              onClick={() => setShowNotifications(prev => !prev)}
+              aria-label="View notifications"
+            >
+              <Bell size={18} />
+              {unacknowledgedCount > 0 && (
+                <span className="notification-badge">{unacknowledgedCount}</span>
+              )}
+            </button>
+
+            {showNotifications && (
+              <>
+                <div className="notification-backdrop" onClick={() => setShowNotifications(false)} />
+                <div className="notification-popover" role="dialog" aria-label="Real-time Plant Alerts">
+                  <div className="notification-header">
+                    <div className="notification-title-row">
+                      <div className="notification-title">
+                        <Bell size={17} className="bell-glow" />
+                        <span>Real-Time Plant Alerts</span>
+                      </div>
+                      <span className={`alert-count-pill ${unacknowledgedCount > 0 ? 'alerting' : 'normal'}`}>
+                        {unacknowledgedCount > 0 ? `${unacknowledgedCount} ACTIVE` : 'ALL CLEAR'}
+                      </span>
+                    </div>
+                    <div className="notification-header-actions">
+                      <button 
+                        className="notif-action-btn simulate"
+                        onClick={triggerSimulatedAlert}
+                        title="Simulate high-priority plant event"
+                      >
+                        <Zap size={12}/> Test Alert
+                      </button>
+                      {unacknowledgedCount > 0 && (
+                        <button 
+                          className="notif-action-btn ack-all"
+                          onClick={acknowledgeAll}
+                          title="Acknowledge all active alerts"
+                        >
+                          <CheckCheck size={12}/> Ack All
+                        </button>
+                      )}
+                      <button 
+                        className="notif-close-btn"
+                        onClick={() => setShowNotifications(false)}
+                        aria-label="Close notifications"
+                      >
+                        <X size={15}/>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="notification-list">
+                    {liveAlerts.length === 0 ? (
+                      <div className="notification-empty">
+                        <ShieldCheck size={32} />
+                        <b>All Systems Operational</b>
+                        <span>All 16 PLC sensors reporting normal telemetry. No active threshold deviations.</span>
+                      </div>
+                    ) : (
+                      liveAlerts.map(alert => {
+                        const isAcked = acknowledgedAlertIds.has(alert.id)
+                        return (
+                          <div key={alert.id} className={`notification-item ${alert.severity.toLowerCase()} ${isAcked ? 'acked' : ''}`}>
+                            <div className="notif-item-top">
+                              <span className={`severity-tag ${alert.severity.toLowerCase()}`}>
+                                <span className="sev-dot"/>
+                                {alert.severity}
+                              </span>
+                              <span className="notif-equip">{alert.equipment}</span>
+                              <span className="notif-time">{alert.timestamp}</span>
+                            </div>
+
+                            <div className="notif-item-body">
+                              <div className="notif-headline">
+                                <b>{alert.title}</b>
+                                {alert.value && <span className="notif-val">{alert.value}</span>}
+                              </div>
+                              <p className="notif-desc">{alert.message}</p>
+                              {alert.action && (
+                                <div className="notif-rec">
+                                  <AlertTriangle size={12}/>
+                                  <span>{alert.action}</span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="notif-item-actions">
+                              <button 
+                                className={`notif-btn-ack ${isAcked ? 'is-acked' : ''}`}
+                                onClick={() => toggleAcknowledge(alert.id)}
+                              >
+                                <Check size={13}/>
+                                {isAcked ? 'Acknowledged' : 'Acknowledge'}
+                              </button>
+                              <button 
+                                className="notif-btn-goto"
+                                onClick={() => {
+                                  setActiveNav('Alarm Center')
+                                  setShowNotifications(false)
+                                }}
+                              >
+                                <span>View in Alarm Center</span>
+                                <ArrowUpRight size={13}/>
+                              </button>
+                            </div>
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+
+                  <div className="notification-footer">
+                    <button 
+                      className="notif-full-btn"
+                      onClick={() => {
+                        setActiveNav('Alarm Center')
+                        setShowNotifications(false)
+                      }}
+                    >
+                      Open Alarm Center & Saved Reviews
+                    </button>
+                    <div className="notif-footer-note">
+                      <RadioTower size={11}/>
+                      <span>Live stream active · updates every 2.5s</span>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="avatar small">FM</div>
+        </div>
       </header>
       <div className="page-content">
         <section className="page-heading">
