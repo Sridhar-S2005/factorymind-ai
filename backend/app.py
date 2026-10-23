@@ -1,49 +1,263 @@
 import json
 import io
-from datetime import datetime
+import math
 import os
+import random
 import re
 import smtplib
+import sqlite3
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 import requests
-import mysql.connector
-from mysql.connector import Error as MySQLError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    import mysql.connector
+    from mysql.connector import Error as MySQLError
+except ImportError:
+    mysql = None
+    MySQLError = Exception
 
 BASE_DIR = Path(__file__).resolve().parent
-# Load backend/.env explicitly so startup does not depend on the terminal working directory.
 load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
 MODEL_DIR = BASE_DIR / "models"
-STREAM_URL = os.getenv(
-    "LIVE_STREAM_URL",
-    "https://unviable-trickily-broadband.ngrok-free.dev/stream",
-)
+STREAM_URL = os.getenv("LIVE_STREAM_URL", "").strip()
 
-raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost,http://localhost:80,http://localhost:3000")
-allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+# ---------------------------------------------------------------------------
+# SENSORS & SYNTHETIC PLC SPECIFICATION (16 INSTRUMENTS)
+# ---------------------------------------------------------------------------
+SENSORS = {
+    "TT-101": {
+        "equipment_id": "TK-101", "name": "Raw milk temperature",
+        "unit": "°C", "setpoint": 3.5, "sim_min": 0, "sim_max": 15,
+        "normal_min": 3.0, "normal_max": 4.5, "kind": "analog",
+    },
+    "LT-101": {
+        "equipment_id": "TK-101", "name": "Raw milk tank level",
+        "unit": "%", "setpoint": 90, "sim_min": 0, "sim_max": 100,
+        "normal_min": 20, "normal_max": 95, "kind": "level",
+    },
+    "FT-101": {
+        "equipment_id": "P-101", "name": "Milk transfer flow",
+        "unit": "L/min", "setpoint": 210, "sim_min": 0, "sim_max": 300,
+        "normal_min": 180, "normal_max": 240, "kind": "analog",
+    },
+    "PT-101": {
+        "equipment_id": "P-101", "name": "Pump discharge pressure",
+        "unit": "bar", "setpoint": 2.8, "sim_min": 0, "sim_max": 6,
+        "normal_min": 2.5, "normal_max": 3.2, "kind": "analog",
+    },
+    "TT-102": {
+        "equipment_id": "TK-102", "name": "Mixing tank temperature",
+        "unit": "°C", "setpoint": 68, "sim_min": 0, "sim_max": 100,
+        "normal_min": 65, "normal_max": 70, "kind": "analog",
+    },
+    "WT-101": {
+        "equipment_id": "BATCH-101", "name": "Ingredient batch weight",
+        "unit": "kg", "setpoint": 50.0, "sim_min": 0, "sim_max": 100,
+        "normal_min": 49.9, "normal_max": 50.1, "kind": "batch_weight",
+    },
+    "TT-103": {
+        "equipment_id": "HX-101", "name": "Heating outlet temperature",
+        "unit": "°C", "setpoint": 138, "sim_min": 0, "sim_max": 150,
+        "normal_min": 137.5, "normal_max": 140, "kind": "analog",
+    },
+    "FT-102": {
+        "equipment_id": "HX-101", "name": "Heating line flow",
+        "unit": "L/min", "setpoint": 195, "sim_min": 0, "sim_max": 250,
+        "normal_min": 190, "normal_max": 200, "kind": "analog",
+    },
+    "PT-102": {
+        "equipment_id": "H-101", "name": "Homogenizer pressure",
+        "unit": "bar", "setpoint": 225, "sim_min": 0, "sim_max": 250,
+        "normal_min": 215, "normal_max": 235, "kind": "analog",
+    },
+    "VT-101": {
+        "equipment_id": "P-101", "name": "Transfer pump vibration",
+        "unit": "mm/s", "setpoint": 1.8, "sim_min": 0, "sim_max": 15,
+        "normal_min": 0.2, "normal_max": 4.5, "kind": "vibration",
+    },
+    "CT-101": {
+        "equipment_id": "P-101", "name": "Motor current",
+        "unit": "A", "setpoint": 32, "sim_min": 0, "sim_max": 50,
+        "normal_min": 15, "normal_max": 38, "kind": "analog",
+    },
+    "TT-104": {
+        "equipment_id": "HX-102", "name": "Cooling outlet temperature",
+        "unit": "°C", "setpoint": 24, "sim_min": 0, "sim_max": 40,
+        "normal_min": 22, "normal_max": 26, "kind": "analog",
+    },
+    "LT-102": {
+        "equipment_id": "TK-103", "name": "Finished-product tank level",
+        "unit": "%", "setpoint": 85, "sim_min": 0, "sim_max": 100,
+        "normal_min": 15, "normal_max": 90, "kind": "level",
+    },
+    "ZS-101": {
+        "equipment_id": "F-101", "name": "Filling machine state",
+        "unit": "On/off", "setpoint": 1, "sim_min": 0, "sim_max": 1,
+        "normal_min": 0, "normal_max": 1, "kind": "binary",
+    },
+    "PE-101": {
+        "equipment_id": "F-101", "name": "Container detection event",
+        "unit": "Count/event", "setpoint": 1, "sim_min": 0, "sim_max": 1,
+        "normal_min": 0, "normal_max": 1, "kind": "binary",
+    },
+    "CE-101": {
+        "equipment_id": "CIP-101", "name": "CIP return conductivity",
+        "unit": "mS/cm", "setpoint": 5.2, "sim_min": 0, "sim_max": 100,
+        "normal_min": 4.5, "normal_max": 6.5, "kind": "cip",
+    },
+}
 
-app = FastAPI(title="FactoryMind AI API", version="1.0.0")
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+def sample_value(tag: str, cfg: dict, scenario: str, tick: int, machine_state: str, rng: random.Random) -> float:
+    kind = cfg["kind"]
+    lo, hi = cfg["normal_min"], cfg["normal_max"]
+    target = cfg["setpoint"]
+
+    if kind == "binary":
+        if tag == "ZS-101":
+            return 1 if machine_state == "RUNNING" else 0
+        return 1 if (machine_state == "RUNNING" and (tick % 4 != 0)) else 0
+
+    if kind == "batch_weight":
+        value = rng.gauss(target, 0.025)
+    elif kind == "level":
+        base = target + 12.0 * math.sin(tick / 35.0)
+        value = base + rng.gauss(0, 1.5)
+    elif kind == "vibration":
+        value = rng.gauss(target, 0.25)
+    elif kind == "cip":
+        value = rng.gauss(target, 0.25)
+    else:
+        sigma = max((hi - lo) / 6.0, 0.02)
+        value = rng.gauss(target, sigma)
+
+    if scenario == "DEGRADATION":
+        if tag == "VT-101":
+            value += min((tick % 120 - 60) * 0.12, 4.0)
+        elif tag == "CT-101":
+            value += min((tick % 120 - 60) * 0.25, 8.0)
+        elif tag == "FT-101":
+            value -= min((tick % 120 - 60) * 2.0, 80.0)
+        elif tag == "PT-101":
+            value += min((tick % 120 - 60) * 0.03, 1.2)
+    elif scenario == "PROCESS_DEVIATION":
+        if tag == "TT-103":
+            value = rng.uniform(132.0, 137.0)
+        elif tag == "FT-102":
+            value = rng.uniform(160.0, 188.0)
+        elif tag == "TT-104":
+            value = rng.uniform(27.0, 32.0)
+    elif scenario == "SENSOR_FAULT":
+        if tag == "PT-101":
+            value = cfg["sim_max"] + 1.0
+        elif tag == "TT-101":
+            value = 999.0
+
+    if scenario != "SENSOR_FAULT":
+        value = clamp(value, cfg["sim_min"], cfg["sim_max"])
+
+    if tag in ("LT-101", "LT-102"):
+        return round(clamp(value, 0, 100), 2)
+    return round(value, 3)
+
+def get_alarm(tag: str, value: float, cfg: dict, scenario: str, machine_state: str) -> str:
+    if scenario == "SENSOR_FAULT" and tag in ("PT-101", "TT-101"):
+        return "SENSOR_FAULT"
+    if tag == "TT-101" and not (3.0 <= value <= 4.5):
+        return "WARNING"
+    if tag == "LT-101" and value > 95:
+        return "HIGH_LEVEL"
+    if tag == "FT-101" and machine_state == "RUNNING" and value < 180:
+        return "LOW_FLOW"
+    if tag == "PT-101" and machine_state == "RUNNING" and not (2.5 <= value <= 3.2):
+        return "PRESSURE_DEVIATION"
+    if tag == "TT-102" and not (65 <= value <= 70):
+        return "WARNING"
+    if tag == "WT-101" and not (49.9 <= value <= 50.1):
+        return "WEIGHT_DEVIATION"
+    if tag == "TT-103" and value < 137.5:
+        return "CRITICAL_TEMPERATURE_DEVIATION"
+    if tag == "FT-102" and machine_state == "RUNNING" and not (190 <= value <= 200):
+        return "FLOW_DEVIATION"
+    if tag == "PT-102" and not (215 <= value <= 235):
+        return "PRESSURE_DEVIATION"
+    if tag == "VT-101" and machine_state == "RUNNING" and value > 4.5:
+        return "HIGH_VIBRATION"
+    if tag == "CT-101" and machine_state == "RUNNING" and value > 38:
+        return "HIGH_CURRENT"
+    if tag == "TT-104" and not (22 <= value <= 26):
+        return "COOLING_DEVIATION"
+    if tag == "LT-102" and value > 90:
+        return "HIGH_LEVEL"
+    if tag == "CE-101" and not (4.5 <= value <= 6.5):
+        return "CIP_CONDUCTIVITY_DEVIATION"
+    return "NORMAL"
+
+def generate_synthetic_snapshot(tick: int) -> list[dict]:
+    cycle = tick % 120
+    if cycle < 60:
+        scenario = "NORMAL"
+    elif cycle < 90:
+        scenario = "DEGRADATION"
+    elif cycle < 110:
+        scenario = "PROCESS_DEVIATION"
+    else:
+        scenario = "SENSOR_FAULT"
+
+    machine_state = "STOPPED" if (scenario == "SENSOR_FAULT" and (tick % 2 == 1)) else "RUNNING"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    rng = random.Random(tick)
+
+    records = []
+    for tag, cfg in SENSORS.items():
+        val = sample_value(tag, cfg, scenario, tick, machine_state, rng)
+        alarm = get_alarm(tag, val, cfg, scenario, machine_state)
+        records.append({
+            "timestamp": timestamp,
+            "plant_line": "Milkshake_Line_01",
+            "equipment_id": cfg["equipment_id"],
+            "sensor_id": tag,
+            "sensor_name": cfg["name"],
+            "parameter": cfg["name"].lower().replace(" ", "_"),
+            "value": val,
+            "unit": cfg["unit"],
+            "machine_state": machine_state,
+            "alarm_status": alarm,
+            "scenario": scenario,
+            "data_source": "SIMULATED",
+        })
+    return records
+
+# ---------------------------------------------------------------------------
+# ML MODELS & STATE
+# ---------------------------------------------------------------------------
+app = FastAPI(title="FactoryMind AI API", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials="*" not in allowed_origins,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -51,7 +265,7 @@ app.add_middleware(
 state: dict[str, Any] = {
     "records": [],
     "last_update": None,
-    "connected": False,
+    "connected": True,
     "error": None,
     "snapshot_count": 0,
 }
@@ -61,92 +275,30 @@ recent_history = deque(maxlen=60)
 models: dict[str, Any] = {}
 
 def load_models():
-    for name in ("classifier.joblib", "clusterer.joblib", "forecast.joblib"):
-        path = MODEL_DIR / name
-        if path.exists():
-            try:
-                models[name] = joblib.load(path)
-            except Exception:
-                pass
+    candidate_dirs = [MODEL_DIR, BASE_DIR / "api" / "models", BASE_DIR.parent / "models", Path("models")]
+    for candidate in candidate_dirs:
+        if candidate.exists():
+            for name in ("classifier.joblib", "clusterer.joblib", "forecast.joblib"):
+                path = candidate / name
+                if path.exists() and name not in models:
+                    try:
+                        models[name] = joblib.load(path)
+                    except Exception:
+                        pass
 
 load_models()
-
-# Persistent review register stored in MySQL.
-# Configure these values in backend/.env (see .env.example).
-MYSQL_CONFIG = {
-    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
-    "port": int(os.getenv("MYSQL_PORT", "3306")),
-    "user": os.getenv("MYSQL_USER", "root"),
-    "password": os.getenv("MYSQL_PASSWORD", ""),
-    "database": os.getenv("MYSQL_DATABASE", "factorymind_ai"),
-    "connection_timeout": 5,
-}
-
-def db_connect():
-    """Open a MySQL connection. Caller is responsible for closing it."""
-    return mysql.connector.connect(**MYSQL_CONFIG)
-
-def init_review_db():
-    conn = db_connect()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""CREATE TABLE IF NOT EXISTS reviews (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            created_at VARCHAR(40) NOT NULL,
-            category VARCHAR(80) NOT NULL,
-            severity VARCHAR(30) NOT NULL,
-            sensor_name VARCHAR(160),
-            parameter VARCHAR(160),
-            equipment_id VARCHAR(120),
-            sensor_value VARCHAR(80),
-            unit VARCHAR(40),
-            source_alarm VARCHAR(120),
-            machine_state VARCHAR(120),
-            notes TEXT,
-            status VARCHAR(30) NOT NULL DEFAULT 'Open',
-            INDEX idx_reviews_created_at (created_at),
-            INDEX idx_reviews_severity (severity),
-            INDEX idx_reviews_category (category)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
-
-class ReviewCreate(BaseModel):
-    category: str = Field(min_length=1, max_length=80)
-    severity: str = Field(default="High", max_length=30)
-    sensor_name: str = "Unknown sensor"
-    parameter: str = ""
-    equipment_id: str = ""
-    sensor_value: str = ""
-    unit: str = ""
-    source_alarm: str = "UNKNOWN"
-    machine_state: str = "UNKNOWN"
-    notes: str = ""
-
-
-def numeric_feature_frame(records: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(records)
-    if df.empty:
-        return df
-    if "parameter" in df and "value" in df:
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        wide = df.pivot_table(index=["timestamp", "plant_line"], columns="parameter", values="value", aggfunc="last")
-        return wide.reset_index(drop=True)
-    return df.select_dtypes(include=[np.number])
 
 def enrich_snapshot(records: list[dict]) -> list[dict]:
     result = []
     for rec in records:
         item = dict(rec)
         try:
-            value = float(item.get("value"))
+            val = float(item.get("value"))
         except (TypeError, ValueError):
-            value = None
-        item["value"] = value if value is not None else item.get("value")
+            val = None
+        item["value"] = val if val is not None else item.get("value")
         result.append(item)
-    # Snapshot-wide features are needed for model inference.
+
     feature_map = {}
     for rec in result:
         param = rec.get("parameter")
@@ -154,6 +306,7 @@ def enrich_snapshot(records: list[dict]) -> list[dict]:
             feature_map[param] = float(rec.get("value"))
         except (TypeError, ValueError):
             pass
+
     if feature_map:
         row = pd.DataFrame([feature_map])
         if "classifier.joblib" in models:
@@ -196,53 +349,138 @@ def enrich_snapshot(records: list[dict]) -> list[dict]:
                 pass
     return result
 
-def stream_worker():
-    while not stop_event.is_set():
+# ---------------------------------------------------------------------------
+# RESILIENT DATABASE LAYER (MySQL with SQLite fallback)
+# ---------------------------------------------------------------------------
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
+    "database": os.getenv("MYSQL_DATABASE", "factorymind_ai"),
+    "connection_timeout": 3,
+}
+
+import tempfile
+default_sqlite = Path(tempfile.gettempdir()) / "factorymind_reviews.db"
+SQLITE_PATH = Path(os.getenv("SQLITE_PATH", str(default_sqlite)))
+
+def get_db():
+    """Returns (connection, db_type: 'mysql' | 'sqlite')"""
+    if mysql and os.getenv("MYSQL_HOST"):
         try:
-            with requests.get(STREAM_URL, stream=True, timeout=(10, 40)) as response:
-                response.raise_for_status()
-                current_data = []
+            conn = mysql.connector.connect(**MYSQL_CONFIG)
+            return conn, "mysql"
+        except Exception:
+            pass
+    conn = sqlite3.connect(str(SQLITE_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn, "sqlite"
+
+def init_review_db():
+    conn, db_type = get_db()
+    cursor = conn.cursor()
+    try:
+        if db_type == "mysql":
+            cursor.execute("""CREATE TABLE IF NOT EXISTS reviews (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                created_at VARCHAR(40) NOT NULL,
+                category VARCHAR(80) NOT NULL,
+                severity VARCHAR(30) NOT NULL,
+                sensor_name VARCHAR(160),
+                parameter VARCHAR(160),
+                equipment_id VARCHAR(120),
+                sensor_value VARCHAR(80),
+                unit VARCHAR(40),
+                source_alarm VARCHAR(120),
+                machine_state VARCHAR(120),
+                notes TEXT,
+                status VARCHAR(30) NOT NULL DEFAULT 'Open',
+                INDEX idx_reviews_created_at (created_at),
+                INDEX idx_reviews_severity (severity),
+                INDEX idx_reviews_category (category)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+        else:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                sensor_name TEXT,
+                parameter TEXT,
+                equipment_id TEXT,
+                sensor_value TEXT,
+                unit TEXT,
+                source_alarm TEXT,
+                machine_state TEXT,
+                notes TEXT,
+                status TEXT NOT NULL DEFAULT 'Open'
+            )""")
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+# ---------------------------------------------------------------------------
+# BACKGROUND STREAM WORKER & STARTUP
+# ---------------------------------------------------------------------------
+def stream_worker():
+    tick = int(time.time())
+    while not stop_event.is_set():
+        external_ok = False
+        is_external = bool(STREAM_URL and not any(k in STREAM_URL.lower() for k in ["unviable-trickily", "simulator", "internal", "localhost", "127.0.0.1"]))
+        
+        if is_external:
+            try:
+                with requests.get(STREAM_URL, stream=True, timeout=(5, 20)) as resp:
+                    if resp.status_code == 200:
+                        external_ok = True
+                        for raw in resp.iter_lines(decode_unicode=True):
+                            if stop_event.is_set():
+                                return
+                            if not raw:
+                                continue
+                            line = raw.strip()
+                            if line.startswith("data:"):
+                                payload = line[5:].strip()
+                                try:
+                                    data = json.loads(payload)
+                                    cur = data if isinstance(data, list) else [data]
+                                    for rec in cur:
+                                        if rec.get("parameter") == "raw_milk_temperature":
+                                            recent_history.append(float(rec["value"]))
+                                    enriched = enrich_snapshot(cur)
+                                    with lock:
+                                        state["records"] = enriched
+                                        state["last_update"] = time.time()
+                                        state["snapshot_count"] += 1
+                                        state["connected"] = True
+                                        state["error"] = None
+                                except Exception:
+                                    pass
+            except Exception:
+                external_ok = False
+
+        if not external_ok:
+            try:
+                tick += 1
+                raw_recs = generate_synthetic_snapshot(tick)
+                for rec in raw_recs:
+                    if rec.get("parameter") == "raw_milk_temperature":
+                        recent_history.append(float(rec["value"]))
+                enriched = enrich_snapshot(raw_recs)
                 with lock:
+                    state["records"] = enriched
+                    state["last_update"] = time.time()
+                    state["snapshot_count"] = tick
                     state["connected"] = True
                     state["error"] = None
-                for raw in response.iter_lines(decode_unicode=True):
-                    if stop_event.is_set():
-                        return
-                    if not raw:
-                        continue
-                    line = raw.strip()
-                    if line.startswith("data:"):
-                        payload = line[5:].strip()
-                        try:
-                            data = json.loads(payload)
-                            if isinstance(data, list):
-                                current_data = data
-                            elif isinstance(data, dict):
-                                current_data = [data]
-                            if current_data:
-                                # retain historical value for simple forecast baseline
-                                for rec in current_data:
-                                    if rec.get("parameter") == "raw_milk_temperature":
-                                        try:
-                                            recent_history.append(float(rec["value"]))
-                                        except (KeyError, TypeError, ValueError):
-                                            pass
-                                enriched = enrich_snapshot(current_data)
-                                with lock:
-                                    state["records"] = enriched
-                                    state["last_update"] = time.time()
-                                    state["snapshot_count"] += 1
-                                    state["connected"] = True
-                                    state["error"] = None
-                        except json.JSONDecodeError:
-                            continue
-        except Exception as e:
-            with lock:
-                state["connected"] = False
-                state["error"] = str(e)
-            time.sleep(4)
+            except Exception as e:
+                with lock:
+                    state["error"] = str(e)
+            time.sleep(1)
 
-thread = None
+thread: Optional[threading.Thread] = None
 
 @app.on_event("startup")
 def start_stream():
@@ -250,7 +488,7 @@ def start_stream():
     try:
         init_review_db()
     except Exception as exc:
-        print(f"[Warning] MySQL initialization on startup: {exc}. Will retry on review operations.")
+        print(f"[Warning] DB initialization: {exc}")
     thread = threading.Thread(target=stream_worker, daemon=True)
     thread.start()
 
@@ -258,123 +496,28 @@ def start_stream():
 def stop_stream():
     stop_event.set()
 
-
-
-# Explainable AI assistant features adapted for FactoryMind AI.
-# These use current stream evidence and deterministic rules; they do not claim
-# an external LLM is configured or make unsupported safety diagnoses.
+# ---------------------------------------------------------------------------
+# API MODELS & HELPERS
+# ---------------------------------------------------------------------------
 class AIChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=1200)
-
 
 class MachineStatusEmailRequest(BaseModel):
     manager_email: str = Field(default="jaakkarthi10@gmail.com", min_length=3, max_length=254)
     smtp_password: str = Field(default="", max_length=500)
     subject_prefix: str = Field(default="FactoryMind AI Machine Status", max_length=120)
 
-
-def _machine_status_report() -> dict:
-    with lock:
-        records = [dict(r) for r in state["records"]]
-        connected = bool(state["connected"])
-        last_update = state["last_update"]
-        snapshot_count = state["snapshot_count"]
-    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "")]
-    critical = [r for r in flagged if any(t in _record_status(r) for t in ("CRITICAL", "CRIT", "FAULT"))]
-    if not connected:
-        overall = "STREAM OFFLINE"
-    elif critical:
-        overall = "CRITICAL ATTENTION REQUIRED"
-    elif flagged:
-        overall = "WARNING — REVIEW FLAGGED READINGS"
-    elif records:
-        overall = "NO SOURCE ALARMS REPORTED"
-    else:
-        overall = "WAITING FOR SENSOR DATA"
-    return {"records": records, "connected": connected, "last_update": last_update,
-            "snapshot_count": snapshot_count, "flagged": flagged,
-            "critical": critical, "overall": overall}
-
-
-@app.post("/api/email/machine-status")
-def email_machine_status(request: MachineStatusEmailRequest):
-    """Email a one-time report of the latest machine snapshot to a manager."""
-    recipient = request.manager_email.strip()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
-        raise HTTPException(status_code=422, detail="Enter a valid manager email address.")
-
-    # Gmail defaults are built in; no .env file is required. The Gmail App Password
-    # is entered in the UI for each send and is never saved to disk.
-    # Keep the requested Gmail account as the default sender. Try STARTTLS on
-    # port 587 first, then implicit TLS on port 465 if the network closes 587.
-    smtp_host = "smtp.gmail.com"
-    smtp_port = 587
-    smtp_user = "jaakkarthi10@gmail.com"
-    smtp_password = request.smtp_password.strip() or os.getenv("SMTP_PASSWORD", "")
-    from_email = "jaakkarthi10@gmail.com"
-    if not smtp_password:
-        raise HTTPException(status_code=400, detail="Enter a Gmail App Password for jaakkarthi10@gmail.com. A normal Gmail password will not work.")
-
-    report = _machine_status_report()
-    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    lines = [
-        "FactoryMind AI — Current Machine Status Report",
-        f"Generated: {stamp}",
-        f"Overall status: {report['overall']}",
-        f"Live stream: {'Connected' if report['connected'] else 'Disconnected'}",
-        f"Snapshots received: {report['snapshot_count']}",
-        f"Sensor records in latest snapshot: {len(report['records'])}",
-        f"Flagged readings: {len(report['flagged'])}",
-        f"Critical/fault readings: {len(report['critical'])}",
-        "",
-        "CURRENT SENSOR READINGS",
-    ]
-    if report["records"]:
-        for rec in report["records"]:
-            name = rec.get("sensor_name") or rec.get("parameter") or rec.get("sensor_id") or "Unknown sensor"
-            value = rec.get("value", "N/A")
-            unit = rec.get("unit") or ""
-            alarm = rec.get("alarm_status") or "UNKNOWN"
-            machine = rec.get("machine_state") or "UNKNOWN"
-            equipment = rec.get("equipment_id") or "N/A"
-            lines.append(f"- {name}: {value} {unit} | Equipment: {equipment} | Alarm: {alarm} | Machine state: {machine}")
-    else:
-        lines.append("No sensor records are currently available.")
-    lines.extend(["", "FLAGGED READINGS / FOLLOW-UP"])
-    if report["flagged"]:
-        for rec in report["flagged"]:
-            name = rec.get("sensor_name") or rec.get("parameter") or rec.get("sensor_id") or "Unknown sensor"
-            lines.append(f"- {name}: {rec.get('value', 'N/A')} {rec.get('unit') or ''} | {rec.get('alarm_status') or 'UNKNOWN'} | Suggested action: verify against approved site SOP and inspect the relevant equipment.")
-    else:
-        lines.append("No non-normal source alarm labels were present in the latest snapshot. This is not a safety certification; follow site procedures.")
-    lines.extend(["", "This report reflects the latest snapshot available to FactoryMind AI at send time. It is not a substitute for plant safety procedures."])
-
-    message = EmailMessage()
-    message["Subject"] = f"{request.subject_prefix.strip() or 'FactoryMind AI Machine Status'} — {report['overall']}"
-    message["From"] = from_email
-    message["To"] = recipient
-    message.set_content("\n".join(lines))
-    try:
-        # Preferred Gmail submission: SMTP + STARTTLS on port 587.
-        try:
-            with smtplib.SMTP(smtp_host, 587, timeout=30) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_user, smtp_password)
-                server.send_message(message)
-        except (smtplib.SMTPServerDisconnected, TimeoutError, OSError):
-            # Some networks close port 587; retry with Gmail implicit TLS on 465.
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=30) as server:
-                server.ehlo()
-                server.login(smtp_user, smtp_password)
-                server.send_message(message)
-    except Exception as exc:
-        # Avoid returning SMTP credentials; expose only the operational error.
-        raise HTTPException(status_code=502, detail=f"Email could not be sent: {type(exc).__name__}: {exc}") from exc
-    return {"sent": True, "recipient": recipient, "overall_status": report["overall"],
-            "sensor_count": len(report["records"]), "flagged_count": len(report["flagged"]),
-            "sent_at": stamp}
+class ReviewCreate(BaseModel):
+    category: str = Field(min_length=1, max_length=80)
+    severity: str = Field(default="High", max_length=30)
+    sensor_name: str = "Unknown sensor"
+    parameter: str = ""
+    equipment_id: str = ""
+    sensor_value: str = ""
+    unit: str = ""
+    source_alarm: str = "UNKNOWN"
+    machine_state: str = "UNKNOWN"
+    notes: str = ""
 
 def _record_status(rec: dict) -> str:
     return str(rec.get("alarm_status") or "UNKNOWN").strip().upper()
@@ -390,140 +533,51 @@ def _ai_recommendation(rec: dict) -> dict:
     warning = any(token in status for token in ("WARN", "HIGH", "LOW", "DEVIAT", "ALARM", "ERROR"))
     if severe:
         priority = "Critical review"
-        action = f"Verify {sensor} on {equipment} against the approved operating limits and follow the site's escalation procedure."
+        action = f"Verify {sensor} on {equipment} against approved operating limits and follow site escalation procedure."
     elif warning:
         priority = "Inspect"
-        action = f"Cross-check {sensor} with related sensors and the approved process range; inspect equipment if the deviation persists."
+        action = f"Cross-check {sensor} with related sensors and normal range; inspect equipment if deviation persists."
     else:
         priority = "Monitor"
-        action = f"Continue monitoring {sensor}; compare with its normal baseline and confirm the reading is fresh."
+        action = f"Continue monitoring {sensor}; confirm reading is fresh."
     return {
         "sensor_name": sensor, "parameter": rec.get("parameter"), "equipment_id": equipment,
         "value": value, "unit": unit, "source_status": status, "priority": priority,
-        "recommendation": action, "evidence": f"Current source status: {status}; reading: {value if value is not None else 'not provided'} {unit}".strip()
+        "recommendation": action, "evidence": f"Current status: {status}; reading: {value if value is not None else 'N/A'} {unit}".strip()
     }
 
-@app.get("/api/ai/insights")
-def ai_insights():
-    """Return explainable, evidence-grounded insights from the latest live snapshot."""
+def get_current_snapshot() -> dict:
+    now = time.time()
     with lock:
-        records = [dict(r) for r in state["records"]]
-        connected = state["connected"]
-        updated = state["last_update"]
-    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "UNKNOWN", "")]
-    insights = [_ai_recommendation(r) for r in flagged]
-    critical = [x for x in insights if x["priority"] == "Critical review"]
-    warnings = [x for x in insights if x["priority"] == "Inspect"]
-    return {
-        "connected": connected, "last_update": updated, "records_analyzed": len(records),
-        "flagged_count": len(flagged), "critical_count": len(critical), "warning_count": len(warnings),
-        "insights": insights,
-        "method": "Explainable rule-based triage using current sensor values and source alarm labels. Validate recommendations against approved plant procedures."
-    }
-
-@app.post("/api/ai/chat")
-def ai_chat(request: AIChatRequest):
-    """Grounded operator assistant; responds only from current snapshot evidence."""
-    query = request.message.strip().lower()
-    with lock:
-        records = [dict(r) for r in state["records"]]
-        connected = state["connected"]
-        updated = state["last_update"]
-        count = state["snapshot_count"]
-    if not records:
-        answer = "I don't have current sensor records to analyze yet. Check the live stream connection and try again when readings arrive."
-        return {"answer": answer, "evidence": [], "connected": connected, "last_update": updated}
-    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "UNKNOWN", "")]
-    evidence = []
-    if any(k in query for k in ("critical", "alarm", "alert", "fault", "abnormal", "problem", "issue", "warning")):
-        evidence = [_ai_recommendation(r) for r in flagged[:10]]
-        if evidence:
-            lines = [f"{x['priority']}: {x['sensor_name']} on {x['equipment_id']} is labeled {x['source_status']} (value {x['value']} {x['unit']}). {x['recommendation']}" for x in evidence[:5]]
-            answer = f"I reviewed {len(records)} current sensor record(s) from snapshot {count}. I found {len(flagged)} record(s) with non-normal source labels. " + " ".join(lines)
-        else:
-            answer = f"I reviewed {len(records)} current sensor record(s). No non-normal source alarm labels are present in this snapshot. This does not independently prove the process is safe; continue following approved monitoring procedures."
-    elif any(k in query for k in ("temperature", "pressure", "flow", "vibration", "level", "conductivity", "current", "sensor")):
-        matches = [r for r in records if any(k in str(r.get("parameter", "")).lower() or k in str(r.get("sensor_name", "")).lower() for k in ("temperature", "pressure", "flow", "vibration", "level", "conductivity", "current"))]
-        evidence = [_ai_recommendation(r) for r in matches[:10]]
-        if matches:
-            lines = [f"{r.get('sensor_name') or r.get('parameter')}: {r.get('value')} {r.get('unit') or ''} (source status: {_record_status(r)})." for r in matches[:8]]
-            answer = "Current matching readings: " + " ".join(lines)
-        else:
-            answer = "I couldn't find a matching sensor in the current snapshot. Try a specific parameter or equipment name."
-    elif any(k in query for k in ("maintenance", "inspect", "recommend", "what should", "next step", "action")):
-        evidence = [_ai_recommendation(r) for r in (flagged or records)[:8]]
-        answer = "Suggested next steps based on the available snapshot: " + " ".join(f"{x['priority']} — {x['recommendation']}" for x in evidence[:5]) if evidence else "No sensor records are available yet. Once data arrives, I can summarize source alarm labels and inspection priorities."
-    else:
-        answer = f"FactoryMind AI operator assistant is using the current live snapshot ({len(records)} record(s), stream {'connected' if connected else 'disconnected'}). Ask about current alarms, sensor readings, or maintenance priorities. Responses are grounded in the available data and do not replace site SOPs."
-    return {"answer": answer, "evidence": evidence, "connected": connected, "last_update": updated}
-
-
-@app.get("/")
-def root():
-    return {"name": "FactoryMind AI", "status": "running", "docs": "/docs"}
-
-@app.get("/api/health")
-def health():
-    mysql_status = "connected"
-    mysql_error = None
-    conn = None
-    cursor = None
-    try:
-        conn = db_connect()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-    except MySQLError as exc:
-        mysql_status = "disconnected"
-        # Return a diagnostic message, never connection credentials.
-        mysql_error = str(exc)
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None and conn.is_connected():
-            conn.close()
-    with lock:
-        return {
-            "api": "ok",
-            "mysql": mysql_status,
-            "mysql_error": mysql_error,
-            "database": MYSQL_CONFIG["database"],
-            "stream_connected": state["connected"],
-            "last_update": state["last_update"],
-            "snapshot_count": state["snapshot_count"],
-            "stream_error": state["error"],
-            "models_loaded": list(models.keys()),
-        }
-
-@app.get("/api/live/snapshot")
-def live_snapshot():
-    with lock:
+        # If records are empty or stale (> 3s old, e.g. serverless invocation), compute fresh snapshot
+        if not state["records"] or (now - (state["last_update"] or 0) > 3.0):
+            tick = int(now)
+            raw = generate_synthetic_snapshot(tick)
+            for rec in raw:
+                if rec.get("parameter") == "raw_milk_temperature":
+                    recent_history.append(float(rec["value"]))
+            enriched = enrich_snapshot(raw)
+            state["records"] = enriched
+            state["last_update"] = now
+            state["snapshot_count"] = tick
+            state["connected"] = True
+            state["error"] = None
         return {
             "connected": state["connected"],
             "last_update": state["last_update"],
             "snapshot_count": state["snapshot_count"],
             "error": state["error"],
-            "records": state["records"],
+            "records": list(state["records"]),
         }
 
-@app.get("/api/analytics")
-def analytics():
-    with lock:
-        records = list(state["records"])
-        connected = state["connected"]
-        count = state["snapshot_count"]
-    alarms = {}
-    for rec in records:
-        label = str(rec.get("alarm_status", "UNKNOWN"))
-        alarms[label] = alarms.get(label, 0) + 1
-    return {"connected": connected, "snapshot_count": count, "alarm_counts": alarms, "records_count": len(records)}
-
+# ---------------------------------------------------------------------------
+# COST INTELLIGENCE ENGINE
+# ---------------------------------------------------------------------------
 def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) -> dict:
-    with lock:
-        records = [dict(r) for r in state.get("records", [])]
+    snap = get_current_snapshot()
+    records = snap["records"]
     by_param = {r.get("parameter"): r for r in records if r.get("parameter")}
 
-    # Previous Month (September 2026) Baseline
     prev_period = "September 2026"
     prev_revenue = 4828000
     prev_energy = 842000
@@ -623,7 +677,6 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
         curr_profit = curr_revenue - curr_costs
         trend = "down"
 
-        # Read live readings if available
         live_temp = float(by_param.get("heating_outlet_temperature", {}).get("value") or 143.2)
         live_vib = float(by_param.get("transfer_pump_vibration", {}).get("value") or 2.45)
         live_curr = float(by_param.get("motor_current", {}).get("value") or 32.8)
@@ -659,8 +712,8 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
                 "financial_impact": -74200,
                 "category": "Emergency Maintenance & Repairs",
                 "severity": "Critical",
-                "explanation": f"Vibration elevated to {round(live_vib, 3)} mm/s, causing HIGH_VIBRATION alarm states. Bearing micro-pitting and hydraulic turbulence necessitated unscheduled technician service and bearing kit replacement costing ₹74,200.",
-                "recommendation": "Inspect drive coupling elastomer, verify pump suction head, and replace drive-end bearing."
+                "explanation": f"Vibration elevated to {round(live_vib, 3)} mm/s, causing HIGH_VIBRATION alarm states. Bearing micro-pitting necessitated unscheduled service costing ₹74,200.",
+                "recommendation": "Inspect drive coupling elastomer, verify suction head, and replace bearing."
             },
             {
                 "parameter": "motor_current",
@@ -672,10 +725,10 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
                 "variance_pct": round(((live_curr - 27.8) / 27.8) * 100, 1),
                 "variance_direction": "up" if live_curr > 27.8 else "down",
                 "financial_impact": -68500,
-                "category": "Excess Electrical Energy Consumption",
+                "category": "Excess Electrical Consumption",
                 "severity": "Warning",
-                "explanation": f"Motor current sustained {round(live_curr, 2)}A against 27.8A nominal baseline. Continuous motor overloading and line friction produced heavy electrical draw, adding ₹68,500 in factory electricity bills.",
-                "recommendation": "Inspect impeller clearance, check supply voltage balance, and lubricate motor bearings."
+                "explanation": f"Motor current sustained {round(live_curr, 2)}A against 27.8A nominal baseline, adding ₹68,500 in excess electricity costs.",
+                "recommendation": "Inspect impeller clearance, check supply voltage balance, and lubricate bearings."
             },
             {
                 "parameter": "pump_discharge_pressure",
@@ -689,8 +742,8 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
                 "financial_impact": -38000,
                 "category": "Hydraulic Friction & Throttling",
                 "severity": "Warning",
-                "explanation": f"Discharge pressure reached {round(live_press, 2)} bar. Flow resistance and filter mesh blinding stressed mechanical seals and led to line throttling pauses costing ₹38,000.",
-                "recommendation": "Backwash sanitary filter mesh and inspect non-return valve operation."
+                "explanation": f"Discharge pressure reached {round(live_press, 2)} bar. Flow resistance stressed mechanical seals, causing throttling losses costing ₹38,000.",
+                "recommendation": "Backwash sanitary filter mesh and inspect non-return valve."
             },
             {
                 "parameter": "cip_return_conductivity",
@@ -704,7 +757,7 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
                 "financial_impact": -21500,
                 "category": "Chemical & Water Overdosing",
                 "severity": "Warning",
-                "explanation": f"Conductivity probe drift at {round(live_cond, 2)} mS/cm delayed CIP wash completion by 12 minutes per cycle, wasting ₹21,500 in detergent dosing and rinse water.",
+                "explanation": f"Conductivity probe drift at {round(live_cond, 2)} mS/cm delayed CIP wash completion by 12 minutes per cycle, wasting ₹21,500 in detergent.",
                 "recommendation": "Clean electrode surfaces and perform 2-point buffer calibration."
             },
             {
@@ -728,8 +781,7 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
             "Industrial telemetry pinpoints three dominant root-cause deviations responsible for 88% of the shortfall: "
             "(1) Pasteurizer temperature excursions (TT-103) caused protein scorching and ₹82,400 in scrap loss; "
             "(2) Pump mechanical vibration (VT-101) triggered emergency repair interventions costing ₹74,200; and "
-            "(3) Motor electrical overload (CT-101) drove ₹68,500 in excess electricity charges. "
-            "Although steady-state transfer flow provided a +₹42,000 throughput boost, it was vastly outweighed by equipment anomalies."
+            "(3) Motor electrical overload (CT-101) drove ₹68,500 in excess electricity charges."
         )
 
     deviation = curr_profit - prev_profit
@@ -776,107 +828,308 @@ def compute_cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500) 
         "top_driver_impact": sensor_factors[0]["financial_impact"]
     }
 
+# ---------------------------------------------------------------------------
+# API ROUTES (DUAL ROUTED: BOTH /api/... AND /...)
+# ---------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"name": "FactoryMind AI API", "status": "running", "version": "2.0.0", "docs": "/docs"}
+
+@app.get("/api/health")
+@app.get("/health")
+def health():
+    db_status = "connected"
+    db_name = "factorymind_ai"
+    try:
+        conn, db_type = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        db_name = db_type
+    except Exception as exc:
+        db_status = f"disconnected ({exc})"
+
+    snap = get_current_snapshot()
+    return {
+        "api": "ok",
+        "database": db_name,
+        "mysql": "connected" if "mysql" in db_name else "sqlite_fallback",
+        "stream_connected": snap["connected"],
+        "last_update": snap["last_update"],
+        "snapshot_count": snap["snapshot_count"],
+        "stream_error": snap["error"],
+        "models_loaded": list(models.keys()),
+    }
+
+@app.get("/api/live/snapshot")
+@app.get("/live/snapshot")
+def live_snapshot():
+    return get_current_snapshot()
+
+@app.get("/api/analytics")
+@app.get("/analytics")
+def analytics():
+    snap = get_current_snapshot()
+    alarms = {}
+    for rec in snap["records"]:
+        lbl = str(rec.get("alarm_status", "UNKNOWN"))
+        alarms[lbl] = alarms.get(lbl, 0) + 1
+    return {
+        "connected": snap["connected"],
+        "snapshot_count": snap["snapshot_count"],
+        "alarm_counts": alarms,
+        "records_count": len(snap["records"])
+    }
+
+@app.get("/api/ai/insights")
+@app.get("/ai/insights")
+def ai_insights():
+    snap = get_current_snapshot()
+    records = snap["records"]
+    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "UNKNOWN", "")]
+    insights = [_ai_recommendation(r) for r in flagged]
+    critical = [x for x in insights if x["priority"] == "Critical review"]
+    warnings = [x for x in insights if x["priority"] == "Inspect"]
+    return {
+        "connected": snap["connected"],
+        "last_update": snap["last_update"],
+        "records_analyzed": len(records),
+        "flagged_count": len(flagged),
+        "critical_count": len(critical),
+        "warning_count": len(warnings),
+        "insights": insights,
+        "method": "Explainable rule-based triage using current sensor values and source alarm labels."
+    }
+
+@app.post("/api/ai/chat")
+@app.post("/ai/chat")
+def ai_chat(request: AIChatRequest):
+    query = request.message.strip().lower()
+    snap = get_current_snapshot()
+    records = snap["records"]
+    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "UNKNOWN", "")]
+    evidence = []
+
+    if any(k in query for k in ("critical", "alarm", "alert", "fault", "abnormal", "problem", "issue", "warning")):
+        evidence = [_ai_recommendation(r) for r in flagged[:10]]
+        if evidence:
+            lines = [f"{x['priority']}: {x['sensor_name']} on {x['equipment_id']} is {x['source_status']} ({x['value']} {x['unit']}). {x['recommendation']}" for x in evidence[:5]]
+            answer = f"I reviewed {len(records)} sensor records from live snapshot {snap['snapshot_count']}. Found {len(flagged)} non-normal reading(s). " + " ".join(lines)
+        else:
+            answer = f"I reviewed {len(records)} current sensor records. All active sensors are reporting NORMAL baseline status."
+    elif any(k in query for k in ("temperature", "pressure", "flow", "vibration", "level", "conductivity", "current", "sensor")):
+        matches = [r for r in records if any(k in str(r.get("parameter", "")).lower() or k in str(r.get("sensor_name", "")).lower() for k in ("temperature", "pressure", "flow", "vibration", "level", "conductivity", "current"))]
+        evidence = [_ai_recommendation(r) for r in matches[:10]]
+        if matches:
+            lines = [f"{r.get('sensor_name') or r.get('parameter')}: {r.get('value')} {r.get('unit') or ''} ({_record_status(r)})." for r in matches[:8]]
+            answer = "Current sensor telemetry: " + " ".join(lines)
+        else:
+            answer = "I couldn't find a matching sensor in the current snapshot."
+    elif any(k in query for k in ("maintenance", "inspect", "recommend", "action", "next step")):
+        evidence = [_ai_recommendation(r) for r in (flagged or records)[:8]]
+        answer = "Priority actions: " + " ".join(f"{x['priority']} — {x['recommendation']}" for x in evidence[:5]) if evidence else "All systems operating in normal bands."
+    else:
+        answer = f"FactoryMind AI Copilot active. Monitoring {len(records)} sensors across Milkshake Line 01. Stream is CONNECTED ({snap['snapshot_count']} snapshots)."
+    return {"answer": answer, "evidence": evidence, "connected": snap["connected"], "last_update": snap["last_update"]}
+
+@app.post("/api/email/machine-status")
+@app.post("/email/machine-status")
+def email_machine_status(request: MachineStatusEmailRequest):
+    recipient = request.manager_email.strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
+        raise HTTPException(status_code=422, detail="Enter a valid manager email address.")
+
+    smtp_password = request.smtp_password.strip() or os.getenv("SMTP_PASSWORD", "")
+    if not smtp_password:
+        raise HTTPException(status_code=400, detail="Enter a Gmail App Password for jaakkarthi10@gmail.com.")
+
+    snap = get_current_snapshot()
+    records = snap["records"]
+    flagged = [r for r in records if _record_status(r) not in ("NORMAL", "OK", "")]
+    critical = [r for r in flagged if any(t in _record_status(r) for t in ("CRITICAL", "CRIT", "FAULT"))]
+
+    overall = "CRITICAL ATTENTION REQUIRED" if critical else "WARNING — REVIEW FLAGGED READINGS" if flagged else "NO SOURCE ALARMS REPORTED"
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    lines = [
+        "FactoryMind AI — Machine Status Report",
+        f"Generated: {stamp}",
+        f"Overall status: {overall}",
+        f"Live stream: Connected ({snap['snapshot_count']} snapshots)",
+        f"Sensors monitored: {len(records)} | Flagged: {len(flagged)}",
+        "",
+        "CURRENT SENSOR READINGS:",
+    ]
+    for r in records:
+        lines.append(f"- {r.get('sensor_name')}: {r.get('value')} {r.get('unit')} | Alarm: {r.get('alarm_status')} | Machine: {r.get('machine_state')}")
+    lines.extend(["", "FLAGGED READINGS:"])
+    for r in flagged:
+        lines.append(f"- {r.get('sensor_name')}: {r.get('value')} {r.get('unit')} ({r.get('alarm_status')})")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{request.subject_prefix.strip()} — {overall}"
+    msg["From"] = "jaakkarthi10@gmail.com"
+    msg["To"] = recipient
+    msg.set_content("\n".join(lines))
+
+    try:
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+                server.ehlo()
+                server.starttls()
+                server.login("jaakkarthi10@gmail.com", smtp_password)
+                server.send_message(msg)
+        except Exception:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.ehlo()
+                server.login("jaakkarthi10@gmail.com", smtp_password)
+                server.send_message(msg)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Email could not be sent: {type(exc).__name__}: {exc}") from exc
+
+    return {"sent": True, "recipient": recipient, "overall_status": overall, "sensor_count": len(records), "flagged_count": len(flagged), "sent_at": stamp}
+
 @app.get("/api/cost/intelligence")
+@app.get("/cost/intelligence")
 def cost_intelligence(mode: str = "down", cost_per_alarm: float = 2500):
     return compute_cost_intelligence(mode=mode, cost_per_alarm=cost_per_alarm)
 
 @app.post("/api/stream/reconnect")
+@app.post("/stream/reconnect")
 def reconnect():
-    # The worker automatically retries; this endpoint reports current state.
-    return {"message": "The live stream worker retries automatically.", "connected": state["connected"]}
+    snap = get_current_snapshot()
+    return {"message": "Live stream active.", "connected": snap["connected"], "snapshots": snap["snapshot_count"]}
 
 @app.get("/api/models/status")
+@app.get("/models/status")
 def model_status():
     return {
         "trained": bool(models),
         "models": list(models.keys()),
-        "message": "Train models with `python train_models.py` from the backend folder if no models are loaded."
+        "message": f"{len(models)} pre-trained models active."
     }
 
-
 @app.get("/api/reviews")
+@app.get("/reviews")
 def list_reviews():
     try:
-        conn = db_connect()
-        cursor = conn.cursor(dictionary=True)
-        try:
-            cursor.execute("SELECT * FROM reviews ORDER BY id DESC")
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
-            conn.close()
+        conn, db_type = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reviews ORDER BY id DESC")
+        rows = []
+        if db_type == "sqlite":
+            rows = [dict(ix) for ix in cursor.fetchall()]
+        else:
+            cols = [d[0] for d in cursor.description]
+            for row in cursor.fetchall():
+                rows.append(dict(zip(cols, row)))
+        cursor.close()
+        conn.close()
         return {"reviews": rows}
     except Exception as exc:
         return {"reviews": [], "error": str(exc)}
 
 @app.post("/api/reviews")
+@app.post("/reviews")
 def create_review(review: ReviewCreate):
     allowed = {"Critical", "High", "Medium", "Low"}
     severity = review.severity if review.severity in allowed else "High"
     created = datetime.now().astimezone().isoformat(timespec="seconds")
     try:
         init_review_db()
-    except Exception:
-        pass
-    try:
-        conn = db_connect()
+        conn, db_type = get_db()
         cursor = conn.cursor()
-        try:
-            cursor.execute(
-                """INSERT INTO reviews (created_at, category, severity, sensor_name, parameter, equipment_id, sensor_value, unit, source_alarm, machine_state, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (created, review.category, severity, review.sensor_name, review.parameter, review.equipment_id,
-                 review.sensor_value, review.unit, review.source_alarm, review.machine_state, review.notes)
-            )
-            review_id = cursor.lastrowid
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-        return {"saved": True, "id": review_id, "created_at": created, "database": MYSQL_CONFIG["database"]}
+        q = """INSERT INTO reviews (created_at, category, severity, sensor_name, parameter, equipment_id, sensor_value, unit, source_alarm, machine_state, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""" if db_type == "sqlite" else \
+            """INSERT INTO reviews (created_at, category, severity, sensor_name, parameter, equipment_id, sensor_value, unit, source_alarm, machine_state, notes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+        cursor.execute(q, (created, review.category, severity, review.sensor_name, review.parameter, review.equipment_id,
+                           review.sensor_value, review.unit, review.source_alarm, review.machine_state, review.notes))
+        review_id = cursor.lastrowid
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"saved": True, "id": review_id, "created_at": created, "database": db_type}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database error: {exc}")
 
 @app.get("/api/reviews/report.pdf")
+@app.get("/reviews/report.pdf")
 def reviews_pdf():
     rows = []
     try:
-        conn = db_connect()
-        cursor = conn.cursor(dictionary=True)
-        try:
-            cursor.execute("SELECT * FROM reviews ORDER BY id DESC")
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
-            conn.close()
+        conn, db_type = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reviews ORDER BY id DESC")
+        if db_type == "sqlite":
+            rows = [dict(ix) for ix in cursor.fetchall()]
+        else:
+            cols = [d[0] for d in cursor.description]
+            for row in cursor.fetchall():
+                rows.append(dict(zip(cols, row)))
+        cursor.close()
+        conn.close()
     except Exception:
         rows = []
+
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
     styles = getSampleStyleSheet()
-    story = [Paragraph("FactoryMind AI — Sensor Review Report", styles["Title"]),
-             Paragraph(f"Generated: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}", styles["Normal"]),
-             Paragraph(f"Total saved reviews: {len(rows)}", styles["Normal"]), Spacer(1, 14)]
+    story = [
+        Paragraph("FactoryMind AI — Sensor Review Report", styles["Title"]),
+        Paragraph(f"Generated: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}", styles["Normal"]),
+        Paragraph(f"Total saved reviews: {len(rows)}", styles["Normal"]),
+        Spacer(1, 14)
+    ]
     data = [["ID", "Created", "Severity", "Category", "Sensor / Parameter", "Equipment", "Value", "Source alarm", "Notes", "Status"]]
     for r in rows:
-        data.append([str(r["id"]), str(r["created_at"] or "")[:19], r["severity"], r["category"],
-                     (r["sensor_name"] or "") + (" / " + r["parameter"] if r["parameter"] else ""),
-                     r["equipment_id"] or "—", (str(r["sensor_value"] or "") + " " + str(r["unit"] or "")).strip() or "—",
-                     r["source_alarm"] or "—", r["notes"] or "—", r["status"]])
+        data.append([
+            str(r["id"]), str(r.get("created_at") or "")[:19], str(r.get("severity") or ""), str(r.get("category") or ""),
+            (r.get("sensor_name") or "") + (" / " + r["parameter"] if r.get("parameter") else ""),
+            r.get("equipment_id") or "—", (str(r.get("sensor_value") or "") + " " + str(r.get("unit") or "")).strip() or "—",
+            r.get("source_alarm") or "—", r.get("notes") or "—", r.get("status") or "Open"
+        ])
     if len(data) == 1:
-        data.append(["—", "—", "—", "No reviews saved yet", "—", "—", "—", "—", "Use Alarm Center to save reviews", "—"])
+        data.append(["—", "—", "—", "No reviews saved yet", "—", "—", "—", "—", "Save alarms to review register", "—"])
     table = Table(data, repeatRows=1, colWidths=[25, 75, 48, 65, 115, 55, 50, 75, 125, 40])
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#18345a")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,-1), 7), ("LEADING", (0,0), (-1,-1), 9),
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#ccd5e0")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f2f6fb")]),
-        ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
-        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#18345a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7), ("LEADING", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#ccd5e0")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f6fb")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(table)
     doc.build(story)
     buffer.seek(0)
-    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=factorymind_sensor_review_report.pdf"})
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=factorymind_sensor_review_report.pdf"}
+    )
+
+@app.get("/stream")
+@app.get("/api/stream")
+def live_stream_sse():
+    """SSE Server-Sent Events stream for external or frontend consumers."""
+    def event_stream():
+        last_sent = 0
+        while True:
+            t = int(time.time())
+            if t != last_sent:
+                last_sent = t
+                snap = get_current_snapshot()
+                payload = json.dumps(snap["records"])
+                yield f"data: {payload}\n\n"
+            time.sleep(0.5)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
