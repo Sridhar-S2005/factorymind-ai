@@ -132,7 +132,14 @@ export default function App() {
     load()
     const a = setInterval(load, refreshMs)
     const b = setInterval(() => setNow(new Date()), 1000)
-    return () => { clearInterval(a); clearInterval(b) }
+    const handleKey = e => {
+      if (e.key === 'Escape') {
+        setShowNotifications(false)
+        setMobileMenuOpen(false)
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => { clearInterval(a); clearInterval(b); window.removeEventListener('keydown', handleKey) }
   }, [refreshMs])
   const records = snapshot.records || []
   const byParam = useMemo(() => Object.fromEntries(records.map(r => [r.parameter, r])), [records])
@@ -368,7 +375,7 @@ export default function App() {
     <main className="main">
       <header className="topbar">
         <div className="topbar-left">
-          <button className="mobile-menu-btn" onClick={() => setMobileMenuOpen(true)} aria-label="Open menu"><Menu size={20}/></button>
+          <button className="mobile-menu-btn" onClick={() => { setMobileMenuOpen(true); setShowNotifications(false); }} aria-label="Open menu"><Menu size={20}/></button>
           <div className="crumb"><span>Workspace</span><span className="slash">/</span><b>{activeNav}</b></div>
         </div>
         <div className="top-actions">
@@ -382,7 +389,7 @@ export default function App() {
             <button 
               className={`icon-button notification ${showNotifications ? 'active' : ''} ${unacknowledgedCount > 0 ? 'has-alerts' : ''}`} 
               title="Real-time Alerts & Notifications"
-              onClick={() => setShowNotifications(prev => !prev)}
+              onClick={() => { setMobileMenuOpen(false); setShowNotifications(prev => !prev); }}
               aria-label="View notifications"
             >
               <Bell size={18} />

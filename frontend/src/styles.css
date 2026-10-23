@@ -46,7 +46,8 @@ body{color:#18324a;background:#edf6fc}
 .plant-selector small,.profile small,.sidebar-status small{color:#67839a}
 .nav-caption{color:#6d8aa1}.nav-item{color:#46657d}.nav-item:hover{background:#e0f1fc;color:#123b5b}.nav-item.active{background:linear-gradient(100deg,#c5eaff,#d9edff);color:#075b91;box-shadow:inset 3px 0 #079bd3,0 4px 14px rgba(27,119,174,.08)}
 .sidebar-status{border-color:#cfe1ee}.status-icon.good{background:#d9f7ec;color:#087c5a}.status-icon.bad{background:#ffe4e6;color:#c42d48}
-.topbar{background:rgba(245,251,255,.88);border-bottom-color:#c9dfef;backdrop-filter:blur(16px)}
+.topbar{background:rgba(245,251,255,.96);border-bottom:1px solid #c9dfef;position:sticky;top:0;z-index:1000 !important;overflow:visible !important}
+.page-content{position:relative;z-index:1}
 .crumb{color:#64829a}.crumb b{color:#173b57}.crumb .slash{color:#a3bdce}.clock{color:#628099}.clock b{color:#1e4866}
 .icon-button{background:#edf7fd;border-color:#c6ddec;color:#416782}.icon-button:hover{color:#075b91;border-color:#7bbbdc}
 .page-heading{background:linear-gradient(100deg,rgba(235,248,255,.82),rgba(220,241,253,.58)),url('/plc-industrial-background.png') center 42%/cover;border-color:rgba(99,174,213,.58);box-shadow:0 14px 36px rgba(35,89,122,.12),inset 0 1px rgba(255,255,255,.72)}
@@ -259,12 +260,12 @@ body {
 .app-shell {
   width: 100%;
   max-width: 100vw;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 .main {
   width: 100%;
   max-width: 100vw;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 /* Screen width <= 900px (Mobile and Tablet Portrait) */
@@ -677,6 +678,7 @@ body {
   position: relative;
   display: inline-flex;
   align-items: center;
+  z-index: 1001 !important;
 }
 
 .icon-button.notification {
@@ -739,27 +741,29 @@ body {
 }
 
 .notification-backdrop {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
-  z-index: 998;
-  background: rgba(14, 30, 48, 0.22);
-  backdrop-filter: blur(2px);
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 9998 !important;
+  background: rgba(14, 30, 48, 0.35) !important;
+  backdrop-filter: blur(2px) !important;
 }
 
 .notification-popover {
-  position: absolute;
-  top: calc(100% + 12px);
-  right: 0;
-  width: 440px;
-  max-width: 94vw;
-  background: #ffffff;
-  border: 1px solid #c8deed;
-  border-radius: 16px;
-  box-shadow: 0 20px 50px rgba(15, 38, 64, 0.22), 0 0 1px rgba(0, 0, 0, 0.08);
-  z-index: 999;
+  position: absolute !important;
+  top: calc(100% + 10px) !important;
+  right: 0 !important;
+  width: 440px !important;
+  max-width: 94vw !important;
+  background: #ffffff !important;
+  border: 1px solid #c8deed !important;
+  border-radius: 16px !important;
+  box-shadow: 0 24px 65px rgba(15, 38, 64, 0.38), 0 2px 10px rgba(0, 0, 0, 0.12) !important;
+  z-index: 9999 !important;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1186,13 +1190,15 @@ body {
 /* Mobile Popover Adjustments */
 @media (max-width: 760px) {
   .notification-popover {
-    position: fixed;
-    top: 68px;
-    left: 10px;
-    right: 10px;
-    width: auto;
-    max-width: none;
-    max-height: 82vh;
+    position: fixed !important;
+    top: 66px !important;
+    left: 10px !important;
+    right: 10px !important;
+    width: auto !important;
+    max-width: calc(100vw - 20px) !important;
+    max-height: 82vh !important;
+    z-index: 10000 !important;
+    box-shadow: 0 24px 70px rgba(10, 25, 45, 0.45) !important;
   }
   .notification-list {
     max-height: 52vh;
